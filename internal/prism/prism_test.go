@@ -650,3 +650,18 @@ func TestExtractPrismErrorBody(t *testing.T) {
 		}
 	}
 }
+
+// TestParseStatus_PayloadUsage 验证 usage 在 response.payload 里时也能取到（真实上游形态）。
+func TestParseStatus_PayloadUsage(t *testing.T) {
+	c := &Client{schema: testSchema()}
+	body := `{"status":"completed","request_id":"req-1","response":{"status":"success","payload":{` +
+		`"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],` +
+		`"usage":{"input_tokens":1234,"output_tokens":56}}}}`
+	st, err := c.ParseStatusPayload([]byte(body), "fallback", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Usage == nil || st.Usage.InputTokens != 1234 || st.Usage.OutputTokens != 56 || st.Usage.TotalTokens != 1290 {
+		t.Fatalf("usage 未从 payload 取出: %+v", st.Usage)
+	}
+}

@@ -555,3 +555,41 @@ func TestPool_MaxWaitCapsBlocking(t *testing.T) {
 		t.Errorf("错误信息应提示调大 max_wait: %v", err)
 	}
 }
+
+// TestSQLite_TimestampsRoundTrip 验证请求明细、会话、消息、API Key 的时间读回来不是零值。
+func TestSQLite_TimestampsRoundTrip(t *testing.T) {
+	s, err := NewSQLiteStore(filepath.Join(t.TempDir(), "a.db"), slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	now := time.Now()
+	near := func(name string, got time.Time) {
+		t.Helper()
+		if d := got.Sub(now); d < -2*time.Second || d > 2*time.Second {
+			t.Errorf("%s 时间 = %v，应接近 %v", name, got, now)
+		}
+	}
+
+	_ = s.RecordRequestLog(RequestLogItem{ID: "r1", Timestamp: now, Method: "POST", Path: "/v1/responses"})
+	logs, _, err := s.QueryRequestLogs(RequestLogFilter{Page: 1, PageSize: 10})
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("请求明细: %v %d", err, len(logs))
+	}
+	near("请求明细", logs[0].Timestamp)
+
+	if err := s.SaveAPIKey(APIKeyItem{Key: "sk-x", Name: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	keys, _ := s.ListAPIKeys()
+	found := false
+	for _, k := range keys {
+		if k.Key == "sk-x" {
+			found = true
+			near("API Key", k.CreatedAt)
+		}
+	}
+	if !found {
+		t.Fatal("没有读回刚保存的 API Key")
+	}
+}

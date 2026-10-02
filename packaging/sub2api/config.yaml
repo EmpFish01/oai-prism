@@ -1,0 +1,20 @@
+# OAIprism 作为 SUB2API 上游时的容器内配置。
+# 未写出的项使用内置默认值（与 configs/config.example.yaml 一致，含模型清单与协议 schema）。
+# API Key 由 compose 的 secret 经 OAI_PRISM_API_KEYS_FILE 注入，不写在这里。
+
+server:
+  # 容器内监听全部地址；compose 不发布宿主机端口，只有 SUB2API 的 Docker 网络能连到。
+  host: 0.0.0.0
+  port: 8787
+
+creds:
+  mode: file
+  # SQLite 落在同目录 /data/accounts.db；/data 是命名卷，重建容器不丢账号。
+  file: /data/accounts.json
+
+raw_proxy:
+  # 中转只需要 /v1。/prism/* 会把账号 Cookie 注入到上游请求里，这里不暴露。
+  enabled: false
+
+log:
+  format: text

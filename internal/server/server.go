@@ -143,7 +143,7 @@ func New(cfg *config.Config, log *slog.Logger) (*Server, error) {
 		middleware.MetricsMiddleware(app),
 		// 限流在鉴权之前：拒绝无效流量越早越省资源。
 		middleware.NewRateLimiter(cfg.Facade.RateLimitPerSecond(), cfg.Facade.RateLimitBurst(), app).Middleware(),
-		middleware.APIKeyAuth(cfg.Facade.APIKeys, app, cfg.Facade.Enabled, cfg.Metrics.Health, cfg.Metrics.Ready, cfg.Metrics.Path),
+		middleware.APIKeyAuth(cfg.Facade.APIKeys, app, cfg.Facade.Enabled, cfg.Metrics.Health, cfg.Metrics.Ready, cfg.Metrics.Path, "/dashboard/"),
 	)
 
 	s.srv = &http.Server{

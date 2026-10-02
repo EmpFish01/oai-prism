@@ -1,9 +1,11 @@
 package creds
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -316,5 +318,59 @@ func TestEffectiveCookie_Prism(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("Cookie 头缺少 %s\n实际: %s", want, got)
 		}
+	}
+}
+
+// TestFetchSession_LoggedOutIsAuthError 验证会话接口"200 但未登录"时判为认证失败，
+// 而不是因为请求自带 Cookie 就当成可用。
+func TestFetchSession_LoggedOutIsAuthError(t *testing.T) {
+	bodies := map[string]string{
+		"prism":    `{"session":null,"user":null,"userTier":"logged_out"}`,
+		"nextauth": `{}`,
+	}
+	for name, body := range bodies {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(body))
+			}))
+			defer srv.Close()
+
+			r, err := NewRefresher(config.CredsConfig{}, config.UpstreamConfig{BaseURL: srv.URL}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cur := FromAccountConfig(config.AccountConfig{Cookies: "__Secure-next-auth.session-token=bogus"})
+			_, err = r.FetchSession(context.Background(), cur)
+			if !IsAuthError(err) {
+				t.Fatalf("期望认证失败，得到 %v", err)
+			}
+		})
+	}
+}
+
+// TestFetchSession_LoggedIn 验证正常会话仍然解析成功。
+func TestFetchSession_LoggedIn(t *testing.T) {
+	tok := makeJWT(t, map[string]any{"exp": time.Now().Add(time.Hour).Unix()})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"accessToken": tok,
+			"user":        map[string]any{"id": "u1", "email": "a@example.com"},
+			"account":     map[string]any{"id": "acc1", "planType": "plus"},
+			"userTier":    "plus",
+		})
+	}))
+	defer srv.Close()
+
+	r, err := NewRefresher(config.CredsConfig{}, config.UpstreamConfig{BaseURL: srv.URL}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := r.FetchSession(context.Background(), FromAccountConfig(config.AccountConfig{Cookies: "__Secure-next-auth.session-token=ok"}))
+	if err != nil {
+		t.Fatalf("FetchSession: %v", err)
+	}
+	if c.Email != "a@example.com" || c.Plan != "plus" || c.AccessToken != tok {
+		t.Errorf("解析结果不对: email=%q plan=%q", c.Email, c.Plan)
 	}
 }

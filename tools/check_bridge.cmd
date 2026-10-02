@@ -3,7 +3,9 @@ REM ============================================================
 REM OAIprism 桥一键诊断：codex 报错时先跑这个
 REM ============================================================
 setlocal
-set REPO=F:\Code\Active\OAIprism
+pushd "%~dp0.."
+set REPO=%CD%
+popd
 set FIX=0
 
 echo === 1) codex 配置 ===

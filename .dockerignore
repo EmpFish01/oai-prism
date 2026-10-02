@@ -1,0 +1,16 @@
+# 构建上下文里绝不能带凭据与本地数据
+secrets/
+configs/config.yaml
+configs/secrets/
+packaging/sub2api/secrets/
+packaging/sub2api/.env
+*.db
+*.log
+logs/
+captures/
+bin/
+.git/
+web/node_modules/
+tools/
+docs/
+*.png

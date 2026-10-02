@@ -13,6 +13,7 @@ import (
 	"crypto/subtle"
 	"log/slog"
 	"net/http"
+	"path"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -309,10 +310,19 @@ func APIKeyAuth(keys []string, app *metrics.App, enabled bool, exemptPaths ...st
 		"/readyz":  {},
 		"/metrics": {},
 	}
+	// 以 "/" 结尾的豁免项按前缀匹配，且只放行 GET/HEAD：
+	// 用于控制面板静态资源——浏览器地址栏导航带不上 Bearer，
+	// 而面板的数据请求走 /admin/*，仍然要鉴权。
+	var exemptPrefixes []string
 	for _, p := range exemptPaths {
-		if p = strings.TrimSpace(p); p != "" {
-			exempt[p] = struct{}{}
+		if p = strings.TrimSpace(p); p == "" {
+			continue
 		}
+		if len(p) > 1 && strings.HasSuffix(p, "/") {
+			exemptPrefixes = append(exemptPrefixes, p)
+			continue
+		}
+		exempt[p] = struct{}{}
 	}
 
 	return func(next http.Handler) http.Handler {
@@ -324,6 +334,16 @@ func APIKeyAuth(keys []string, app *metrics.App, enabled bool, exemptPaths ...st
 			if _, ok := exempt[r.URL.Path]; ok {
 				next.ServeHTTP(w, r)
 				return
+			}
+			if len(exemptPrefixes) > 0 && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+				// 先 Clean：防止 /dashboard/../admin/... 借前缀绕过鉴权。
+				clean := path.Clean("/"+r.URL.Path) + "/"
+				for _, p := range exemptPrefixes {
+					if strings.HasPrefix(clean, p) {
+						next.ServeHTTP(w, r)
+						return
+					}
+				}
 			}
 
 			// 兼容三种常见携带方式。

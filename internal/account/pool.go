@@ -21,6 +21,14 @@ import (
 // ErrNoAccount 表示池里没有任何可用账号。
 var ErrNoAccount = errors.New("账号池为空或全部不可用")
 
+// 无账号可用的三种具体原因。前两种是暂时的（等一会儿就恢复，调用方可以重试），
+// 第三种必须人工更新凭据，重试没有意义 —— 门面据此告诉客户端要不要重试。
+var (
+	ErrAllBusy       = errors.New("全部账号已达并发上限")
+	ErrAllCooling    = errors.New("账号池全部冷却")
+	ErrAllAuthFailed = errors.New("全部账号的凭据都已失效")
+)
+
 // Pool 是账号池与调度器。
 //
 // 无锁读取热路径：账号切片本身用 atomic.Pointer 持有，
@@ -209,8 +217,8 @@ func (p *Pool) Acquire(ctx context.Context, stickyKey string) (*Lease, error) {
 		// 直接给出可操作的错误，而不是让调用方白等一个冷却周期。
 		if p.allAuthFailed(all) {
 			return nil, fmt.Errorf(
-				"全部 %d 个账号的凭据都已失效（上游返回 401/403）。"+
-					"等冷却没有意义，请更新凭据后重试", len(all))
+				"%w（%d 个，上游返回 401/403）。等冷却没有意义，请更新凭据后重试",
+				ErrAllAuthFailed, len(all))
 		}
 
 		// 等待也要有上限：一个 HTTP 请求挂几分钟等账号解冻是不可接受的，
@@ -219,8 +227,8 @@ func (p *Pool) Acquire(ctx context.Context, stickyKey string) (*Lease, error) {
 			p.log.Warn("账号池全部冷却且等待时间超过上限",
 				"wait", wait.Round(time.Second), "max", max, "account", target.ID)
 			return nil, fmt.Errorf(
-				"账号池全部冷却，最早需等待 %s（超过上限 %s）。请增加账号或调大 pool.max_wait",
-				wait.Round(time.Second), max)
+				"%w，最早需等待 %s（超过上限 %s）。请增加账号或调大 pool.max_wait",
+				ErrAllCooling, wait.Round(time.Second), max)
 		}
 
 		p.log.Warn("账号池全部冷却，等待",
@@ -253,7 +261,7 @@ func (p *Pool) Acquire(ctx context.Context, stickyKey string) (*Lease, error) {
 		}
 	}
 	if busy == len(all) {
-		return nil, fmt.Errorf("%w: 全部 %d 个账号已达并发上限", ErrNoAccount, len(all))
+		return nil, fmt.Errorf("%w: %w（%d 个）", ErrNoAccount, ErrAllBusy, len(all))
 	}
 	return nil, ErrNoAccount
 }

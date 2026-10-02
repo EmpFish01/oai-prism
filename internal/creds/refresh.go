@@ -53,6 +53,8 @@ type SessionResponse struct {
 		ID       string `json:"id"`
 		PlanType string `json:"planType"`
 	} `json:"account"`
+	// UserTier 是 Prism 会话接口的登录档位；未登录时为 "logged_out"。
+	UserTier string `json:"userTier"`
 	// 兼容 camelCase / snake_case 两种命名。
 	AccessTokenSnake string `json:"access_token"`
 	AccountIDSnake   string `json:"account_id"`
@@ -117,6 +119,13 @@ func (r *Refresher) FetchSession(ctx context.Context, cur *Credential) (*Credent
 	var sr SessionResponse
 	if err := json.Unmarshal(body, &sr); err != nil {
 		return nil, fmt.Errorf("解析会话响应: %w", err)
+	}
+
+	// 凭据无效时会话接口仍回 200：Prism 回 userTier=logged_out，next-auth 回 {}。
+	// 不在这里拦下的话，下面的 Usable() 会因为请求里自带的 Cookie 而判定"可用"，
+	// 任何垃圾 Cookie 都能通过校验，失效账号也会被当成刷新成功。
+	if sr.UserTier == "logged_out" || bytes.Equal(bytes.TrimSpace(body), []byte("{}")) {
+		return nil, &APIError{Op: "session", Status: http.StatusUnauthorized, Body: "会话未登录（凭据无效或已过期）"}
 	}
 
 	next := cur.Clone()

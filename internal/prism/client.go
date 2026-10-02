@@ -795,6 +795,15 @@ func (c *Client) parseEnvelope(v any, raw []byte, fallbackID, prevText string) (
 				payload := env.Response.Payload
 				out.DeltaFiles = payload.DeltaFiles
 				out.OutputItems = payload.Output
+				// usage 在 response.payload 里（CodexPayload 的声明位置）；只读包络顶层
+				// 会让 token 用量永远为空，Codex 的上下文占用显示与自动压缩随之失效。
+				if out.Usage == nil && payload.Usage != nil {
+					u := *payload.Usage
+					if u.TotalTokens == 0 {
+						u.TotalTokens = u.InputTokens + u.OutputTokens
+					}
+					out.Usage = &u
+				}
 
 				// 确定性提取 reasoning 与 assistant 文本
 				for _, item := range payload.Output {

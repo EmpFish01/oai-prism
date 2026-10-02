@@ -62,6 +62,13 @@ type fakeUpstream struct {
 	gens map[string]*genState
 	seq  int
 
+	// maxUserBytes > 0 时，最后一条 user 消息超过它就按真实上游的形态拒绝：
+	// HTTP 200 + response.status=error，reason=unknown，"This request is too large to send…"。
+	maxUserBytes int
+
+	// reply 非空时替代默认回答（分段即逐帧累计的正文）。
+	reply []string
+
 	// conversationID 让测试可以要求上游回一个非空会话 ID。
 	// 默认空（真实上游新建会话时它就是 null）。
 	conversationID string
@@ -84,6 +91,9 @@ type genState struct {
 
 // parts 是假上游"逐字生成"的内容。
 func (f *fakeUpstream) parts() []string {
+	if len(f.reply) > 0 {
+		return f.reply
+	}
 	return []string{"你好", "，这是", "一段流式回答。", "（完）"}
 }
 
@@ -201,6 +211,14 @@ func (f *fakeUpstream) handler() http.Handler {
 		if strings.Contains(r.Header.Get("Authorization"), "bad-token") {
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(`{"error":{"message":"invalid token"}}`))
+			return
+		}
+
+		if f.maxUserBytes > 0 && lastUserTextLen(body) > f.maxUserBytes {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"completed","request_id":"req-big",` +
+				`"response":{"status":"error","payload":{"reason":"unknown",` +
+				`"message":"This request is too large to send. Please shorten your message or selected text and try again."}}}`))
 			return
 		}
 
@@ -2055,4 +2073,268 @@ func TestAdmin_Requests_And_Chat_SQLite(t *testing.T) {
 		t.Fatalf("DELETE /admin/chat/sessions 失败: %v", err)
 	}
 	respDel.Body.Close()
+}
+
+// lastUserTextLen 取 start 请求体里最后一条 user 消息的正文长度。
+func lastUserTextLen(body map[string]any) int {
+	input, _ := body["input"].([]any)
+	for i := len(input) - 1; i >= 0; i-- {
+		item, _ := input[i].(map[string]any)
+		if item["role"] != "user" {
+			continue
+		}
+		n := 0
+		content, _ := item["content"].([]any)
+		for _, c := range content {
+			if cm, ok := c.(map[string]any); ok {
+				txt, _ := cm["text"].(string)
+				n += len(txt)
+			}
+		}
+		return n
+	}
+	return 0
+}
+
+// TestE2E_BridgeShrinksWhenTooLarge 验证三件事：
+//  1. 上游以"请求过大"拒绝时，桥缩小历史预算重试并成功；
+//  2. 学到的预算用于后续请求，不再白跑一轮被拒；
+//  3. 同一 Codex 会话（prompt_cache_key）的多轮复用同一个项目/沙箱 ——
+//     折叠后的 input 每轮都变，不能再拿它做会话指纹。
+func TestE2E_BridgeShrinksWhenTooLarge(t *testing.T) {
+	up := &fakeUpstream{t: t, maxUserBytes: 20 << 10}
+	ts, _ := newTestServer(t, up, goodAccount(), nil)
+
+	send := func(historyKB int) {
+		t.Helper()
+		items := []string{
+			`{"type":"additional_tools","tools":[{"type":"function","name":"exec_command"}]}`,
+			`{"type":"message","role":"developer","content":"` + strings.Repeat("persona ", 4000) + `"}`,
+			`{"type":"message","role":"user","content":"TASK"}`,
+		}
+		for i := 0; i < historyKB; i++ {
+			items = append(items, `{"type":"message","role":"user","content":"`+strings.Repeat("h", 1000)+`"}`)
+		}
+		body := `{"model":"gpt-5","prompt_cache_key":"conv-1","input":[` + strings.Join(items, ",") + `]}`
+		resp, err := http.Post(ts.URL+"/v1/responses", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			b, _ := readBody(resp)
+			t.Fatalf("状态码 %d: %s", resp.StatusCode, b)
+		}
+	}
+
+	send(40)
+	up.mu.Lock()
+	first := len(up.startBodies)
+	up.mu.Unlock()
+	if first != 2 {
+		t.Fatalf("首轮应为一次被拒 + 一次缩小后重试，实际 start %d 次", first)
+	}
+
+	send(45)
+	up.mu.Lock()
+	defer up.mu.Unlock()
+	if len(up.startBodies) != first+1 {
+		t.Errorf("第二轮应直接按学到的预算发送，实际多发了 %d 次", len(up.startBodies)-first)
+	}
+	if n := lastUserTextLen(up.startBodies[len(up.startBodies)-1]); n > up.maxUserBytes {
+		t.Errorf("最终 user 消息 %d 字节，仍超上游上限", n)
+	}
+	if up.projectCount != 1 {
+		t.Errorf("同一 prompt_cache_key 应复用同一个项目，实际建了 %d 个", up.projectCount)
+	}
+}
+
+// sseEvents 把 SSE 响应体解析成 data 对象列表。
+func sseEvents(t *testing.T, body string) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for _, block := range strings.Split(body, "\n\n") {
+		for _, line := range strings.Split(block, "\n") {
+			if data, ok := strings.CutPrefix(line, "data: "); ok {
+				var m map[string]any
+				if err := json.Unmarshal([]byte(data), &m); err != nil {
+					t.Fatalf("SSE data 不是 JSON: %v: %s", err, data)
+				}
+				out = append(out, m)
+			}
+		}
+	}
+	return out
+}
+
+func postBridgeStream(t *testing.T, url string) string {
+	t.Helper()
+	body := `{"model":"gpt-5","stream":true,"prompt_cache_key":"native-1","input":[` +
+		`{"type":"additional_tools","tools":[{"type":"function","name":"exec_command"}]},` +
+		`{"type":"message","role":"user","content":"list the files"}]}`
+	resp, err := http.Post(url+"/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := readBody(resp)
+	return b
+}
+
+// TestE2E_BridgeNativeOutput 验证桥模式按原生顺序输出 [思考摘要][说明文字][工具调用]，
+// 且 response.completed 带 usage —— 否则 Codex 不显示说明与思考，上下文占用恒为 0。
+func TestE2E_BridgeNativeOutput(t *testing.T) {
+	up := &fakeUpstream{t: t, reply: []string{
+		"I'll list the files first.\n",
+		"```codex-exec\nconst r = await tools.exec_command({ cmd: \"ls\" });\n```",
+	}}
+	ts, _ := newTestServer(t, up, goodAccount(), nil)
+
+	var kinds []string
+	var completed map[string]any
+	for _, ev := range sseEvents(t, postBridgeStream(t, ts.URL)) {
+		switch ev["type"] {
+		case "response.output_item.done":
+			item, _ := ev["item"].(map[string]any)
+			kind, _ := item["type"].(string)
+			switch kind {
+			case "reasoning":
+				summary, _ := item["summary"].([]any)
+				first, _ := summary[0].(map[string]any)
+				kind += ":" + first["text"].(string)
+			case "message":
+				content, _ := item["content"].([]any)
+				first, _ := content[0].(map[string]any)
+				kind += ":" + first["text"].(string)
+			}
+			kinds = append(kinds, kind)
+		case "response.completed":
+			completed, _ = ev["response"].(map[string]any)
+		}
+	}
+	if len(kinds) != 3 || kinds[0] != "reasoning:先想一下" || kinds[1] != "message:I'll list the files first." ||
+		(kinds[2] != "function_call" && kinds[2] != "custom_tool_call") {
+		t.Fatalf("条目顺序/内容不对: %q", kinds)
+	}
+	usage, _ := completed["usage"].(map[string]any)
+	if usage == nil || usage["input_tokens"] != float64(12) || usage["output_tokens"] != float64(40) {
+		t.Fatalf("response.completed 应带上游 usage，得到 %v", completed["usage"])
+	}
+	if out, _ := completed["output"].([]any); len(out) != 3 {
+		t.Errorf("completed.output 应含 3 个条目，得到 %d", len(out))
+	}
+}
+
+// TestE2E_BridgeFailureCodes 验证失败事件的 error.code：决定 Codex 重试 5 次还是直接报错。
+func TestE2E_BridgeFailureCodes(t *testing.T) {
+	failedCode := func(body string) string {
+		for _, ev := range sseEvents(t, body) {
+			if ev["type"] == "response.failed" {
+				resp, _ := ev["response"].(map[string]any)
+				e, _ := resp["error"].(map[string]any)
+				code, _ := e["code"].(string)
+				return code
+			}
+		}
+		return ""
+	}
+
+	t.Run("请求过大且已缩到最小", func(t *testing.T) {
+		up := &fakeUpstream{t: t, maxUserBytes: 10}
+		ts, _ := newTestServer(t, up, goodAccount(), nil)
+		if got := failedCode(postBridgeStream(t, ts.URL)); got != "context_length_exceeded" {
+			t.Errorf("code = %q, want context_length_exceeded", got)
+		}
+		// 消息本来就小于预算：缩预算无济于事，不应白跑重试。
+		up.mu.Lock()
+		defer up.mu.Unlock()
+		if len(up.startBodies) != 1 {
+			t.Errorf("缩不小的消息不应重试，实际 start %d 次", len(up.startBodies))
+		}
+	})
+	t.Run("没有账号", func(t *testing.T) {
+		ts, _ := newTestServer(t, &fakeUpstream{t: t}, nil, nil)
+		if got := failedCode(postBridgeStream(t, ts.URL)); got != "invalid_prompt" {
+			t.Errorf("code = %q, want invalid_prompt", got)
+		}
+	})
+}
+
+// TestE2E_NoSleepAfterCompletion 验证拿到终态后立即返回，不再补睡一个轮询间隔。
+// 间隔设成 2 秒、首次轮询即完成：修复前这个请求至少要 2 秒。
+func TestE2E_NoSleepAfterCompletion(t *testing.T) {
+	up := &fakeUpstream{t: t, reply: []string{"done"}}
+	ts, _ := newTestServer(t, up, goodAccount(), func(c *config.Config) {
+		c.Facade.PollInterval = 2 * time.Second
+		c.Facade.PollBackoffMax = 2 * time.Second
+	})
+
+	start := time.Now()
+	resp, err := http.Post(ts.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"gpt-5","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := readBody(resp)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("状态码 %d: %s", resp.StatusCode, b)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("首轮即完成却耗时 %s：终态到手后仍在补睡轮询间隔", d.Round(time.Millisecond))
+	}
+}
+
+// TestE2E_CodexTitleAnsweredLocally 验证 Codex 桌面版的标题请求由网关直接应答：
+// 回结构化 JSON，且上游既没有建项目也没有发起生成（不占沙箱、不与正文请求争用）。
+func TestE2E_CodexTitleAnsweredLocally(t *testing.T) {
+	up := &fakeUpstream{t: t}
+	ts, _ := newTestServer(t, up, goodAccount(), nil)
+
+	prompt := "You are a helpful assistant. You will be presented with a user prompt, and your job is to provide " +
+		"a short title for a task that will be created from that prompt." + "\n\nUser prompt:\n" + "Fix the login bug on Windows"
+	req := map[string]any{
+		"model": "gpt-6-luna", "stream": true, "prompt_cache_key": "title-1",
+		"text": map[string]any{"format": map[string]any{
+			"type": "json_schema", "name": "t",
+			"schema": map[string]any{"type": "object", "properties": map[string]any{
+				"title": map[string]any{"type": "string"}, "description": map[string]any{"type": "string"},
+			}},
+		}},
+		"input": []any{
+			map[string]any{"type": "additional_tools", "tools": []any{}},
+			map[string]any{"type": "message", "role": "user", "content": []any{
+				map[string]any{"type": "input_text", "text": prompt},
+			}},
+		},
+	}
+	b, _ := json.Marshal(req)
+	body := string(b)
+	resp, err := http.Post(ts.URL+"/v1/responses", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := readBody(resp)
+	resp.Body.Close()
+
+	var text string
+	completed := false
+	for _, ev := range sseEvents(t, raw) {
+		switch ev["type"] {
+		case "response.output_text.done":
+			text, _ = ev["text"].(string)
+		case "response.completed":
+			completed = true
+		}
+	}
+	var got map[string]string
+	if !completed || json.Unmarshal([]byte(text), &got) != nil || got["title"] != "Fix the login bug on Windows" {
+		t.Fatalf("应回结构化标题，得到 completed=%v text=%q raw=%.300s", completed, text, raw)
+	}
+
+	up.mu.Lock()
+	defer up.mu.Unlock()
+	if len(up.startBodies) != 0 || up.projectCount != 0 {
+		t.Errorf("标题请求不应触达上游：start %d 次，建项目 %d 个", len(up.startBodies), up.projectCount)
+	}
 }

@@ -1,0 +1,45 @@
+services:
+  oai-prism:
+    build:
+      context: ../..
+      dockerfile: packaging/sub2api/Dockerfile
+    image: oai-prism:local
+    container_name: oai-prism
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    environment:
+      OAI_PRISM_API_KEYS_FILE: /run/secrets/api-key
+      # Optional outbound proxy reachable from inside the container, not the host loopback.
+      OAI_PRISM_HTTP_PROXY: ${OAI_PRISM_HTTP_PROXY:-}
+    secrets:
+      - source: api-key
+        target: api-key
+    volumes:
+      - oai-prism-data:/data
+    networks:
+      - sub2api
+    # Intentionally no ports: only SUB2API's private Docker network can connect.
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+secrets:
+  api-key:
+    file: ./secrets/api-key
+
+volumes:
+  oai-prism-data:
+
+networks:
+  sub2api:
+    external: true
+    name: ${SUB2API_NETWORK:?Set SUB2API_NETWORK to the existing SUB2API Docker network}

@@ -833,7 +833,7 @@ func TestIssue256_ToolBridge_CallIDPreserved(t *testing.T) {
 		{"type":"custom_tool_call","name":"exec_command","call_id":"ctc_123","input":"tools.exec_command({cmd:\"dir\"})"},
 		{"type":"custom_tool_call_output","name":"exec_command","call_id":"ctc_123","output":"main.go\ngo.mod"}
 	]`
-	items := bridgeInputItems([]byte(inputJSON), "base sys")
+	items := bridgeInputItems([]byte(inputJSON), "base sys", bridgeDefaultBudget)
 	if len(items) == 0 {
 		t.Fatalf("bridgeInputItems 解析失败")
 	}

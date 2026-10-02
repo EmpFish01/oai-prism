@@ -1,7 +1,7 @@
 # 编译产物
 bin/
 *.exe
-oaiprism
+/oaiprism
 
 # 本地配置与凭据 —— 绝对不能提交
 configs/config.yaml
@@ -10,6 +10,11 @@ secrets/*.json
 # cookies.txt 是浏览器导出的真实登录凭据，同样绝不入库
 secrets/cookies.txt
 secrets/*.txt
+# 凭据文件按配置目录兜底解析时会落到 configs/secrets/，同样不能入库
+configs/secrets/
+# SUB2API 部署的密钥与环境文件
+packaging/sub2api/secrets/
+packaging/sub2api/.env
 
 # 工作区本地数据（会话记录/抓包缓存）
 .workbuddy/
@@ -38,3 +43,6 @@ coverage.out
 
 # 第三方参考资料与逆向分析产物（含 JS bundle，不入库）
 .ref/
+
+# sidecar 的 Node 依赖（tools/package.json 锁定 playwright-core）
+node_modules/

@@ -443,7 +443,7 @@ func (s *SQLiteStore) QueryRequestLogs(filter RequestLogFilter) ([]RequestLogIte
 	var list []RequestLogItem
 	for rows.Next() {
 		var it RequestLogItem
-		var tsStr string
+		var tsStr any
 		if err := rows.Scan(
 			&it.ID,
 			&tsStr,
@@ -461,9 +461,7 @@ func (s *SQLiteStore) QueryRequestLogs(filter RequestLogFilter) ([]RequestLogIte
 		); err != nil {
 			continue
 		}
-		if t, err := time.Parse("2006-01-02 15:04:05", tsStr); err == nil {
-			it.Timestamp = t
-		}
+		it.Timestamp = dbTime(tsStr)
 		list = append(list, it)
 	}
 
@@ -607,16 +605,11 @@ func (s *SQLiteStore) ListChatSessions() ([]ChatSessionRecord, error) {
 	var list []ChatSessionRecord
 	for rows.Next() {
 		var r ChatSessionRecord
-		var cStr, uStr string
+		var cStr, uStr any
 		if err := rows.Scan(&r.ID, &r.Title, &r.Model, &r.ReasoningEffort, &cStr, &uStr); err != nil {
 			continue
 		}
-		if t, err := time.Parse("2006-01-02 15:04:05", cStr); err == nil {
-			r.CreatedAt = t
-		}
-		if t, err := time.Parse("2006-01-02 15:04:05", uStr); err == nil {
-			r.UpdatedAt = t
-		}
+		r.CreatedAt, r.UpdatedAt = dbTime(cStr), dbTime(uStr)
 		list = append(list, r)
 	}
 	return list, nil
@@ -669,13 +662,11 @@ func (s *SQLiteStore) ListChatMessages(sessionID string) ([]ChatMessageRecord, e
 	var list []ChatMessageRecord
 	for rows.Next() {
 		var m ChatMessageRecord
-		var cStr string
+		var cStr any
 		if err := rows.Scan(&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Reasoning, &m.Status, &cStr); err != nil {
 			continue
 		}
-		if t, err := time.Parse("2006-01-02 15:04:05", cStr); err == nil {
-			m.CreatedAt = t
-		}
+		m.CreatedAt = dbTime(cStr)
 		list = append(list, m)
 	}
 	return list, nil
@@ -734,13 +725,11 @@ func (s *SQLiteStore) ListAPIKeys() ([]APIKeyItem, error) {
 	var list []APIKeyItem
 	for rows.Next() {
 		var it APIKeyItem
-		var cStr string
+		var cStr any
 		if err := rows.Scan(&it.Key, &it.Name, &cStr); err != nil {
 			continue
 		}
-		if t, err := time.Parse("2006-01-02 15:04:05", cStr); err == nil {
-			it.CreatedAt = t
-		}
+		it.CreatedAt = dbTime(cStr)
 		list = append(list, it)
 	}
 	return list, nil
@@ -774,4 +763,25 @@ func (s *SQLiteStore) DeleteAPIKey(key string) error {
 
 	_, err := s.db.Exec("DELETE FROM api_keys WHERE key = ?", key)
 	return err
+}
+
+// dbTime 把时间列的扫描结果转成 time.Time。
+//
+// TIMESTAMP 列会被 modernc.org/sqlite 解析成 time.Time，扫进 string 时格式是
+// RFC 3339 而不是写入时的 "2006-01-02 15:04:05"。只按写入格式解析的话，
+// 所有时间都会变成零值（控制面板里显示 0001-01-01）。两种形态都接受。
+func dbTime(v any) time.Time {
+	switch t := v.(type) {
+	case time.Time:
+		return t
+	case []byte:
+		return dbTime(string(t))
+	case string:
+		for _, layout := range []string{"2006-01-02 15:04:05", time.RFC3339Nano} {
+			if p, err := time.Parse(layout, t); err == nil {
+				return p
+			}
+		}
+	}
+	return time.Time{}
 }

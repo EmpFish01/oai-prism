@@ -264,6 +264,14 @@ type FacadeConfig struct {
 	// 默认开启；若某天上游不再强制沙箱，可以关掉省一次往返。
 	UseSandbox bool `yaml:"use_sandbox"`
 
+	// LocalTitles 让网关直接应答 Codex 桌面版的"自动生成会话标题"请求：
+	// 取用户提示词开头作标题，不经过上游。
+	//
+	// 桌面版每发一条消息都会并行发一次标题请求。走上游时它要单独建项目、
+	// 同步沙箱、生成约 20 秒，还会与正文请求争用同一个沙箱导致正文失败。
+	// 代价是标题取自提示词原文，而不是模型概括。
+	LocalTitles bool `yaml:"local_titles"`
+
 	// SandboxTTL 是沙箱信息的缓存时长。
 	// 申请沙箱要真的分配容器，很慢，必须缓存复用。
 	SandboxTTL time.Duration `yaml:"sandbox_ttl"`
@@ -525,6 +533,7 @@ func Default() *Config {
 			PollBackoffMax:      DefaultPollBackoffMax,
 			SyncTimeout:         10 * time.Minute,
 			UseSandbox:          true,
+			LocalTitles:         true,
 			SandboxTTL:          30 * time.Minute,
 			SandboxReadyWait:    60 * time.Second,
 			DefaultSystemPrompt: DefaultPrismSystemPrompt,
@@ -707,6 +716,9 @@ func Load(path string) (*Config, error) {
 	}
 
 	applyEnv(cfg)
+	if err := applyAPIKeysFile(cfg); err != nil {
+		return nil, err
+	}
 
 	if err := cfg.normalize(); err != nil {
 		return nil, err
@@ -1023,6 +1035,31 @@ func applyEnv(c *Config) {
 			RefreshToken: v,
 		}}, c.Creds.Accounts...)
 	}
+}
+
+// applyAPIKeysFile 从 OAI_PRISM_API_KEYS_FILE 读取 API Key（每行或逗号分隔一个），
+// 便于用 Docker secrets / 权限受限的文件交付密钥，而不是放进环境变量或配置文件。
+//
+// 与 applyEnv 分开是因为这里必须能报错：文件读不到或为空时若静默忽略，
+// 服务会以"不校验 API Key"的状态启动，等于把账号池开放出去。
+func applyAPIKeysFile(c *Config) error {
+	p := strings.TrimSpace(os.Getenv(EnvPrefix + "API_KEYS_FILE"))
+	if p == "" {
+		return nil
+	}
+	if os.Getenv(EnvPrefix+"API_KEYS") != "" {
+		return fmt.Errorf("%sAPI_KEYS 与 %sAPI_KEYS_FILE 不能同时设置", EnvPrefix, EnvPrefix)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return fmt.Errorf("读取 %sAPI_KEYS_FILE: %w", EnvPrefix, err)
+	}
+	keys := splitCSV(strings.NewReplacer("\r\n", ",", "\n", ",").Replace(string(b)))
+	if len(keys) == 0 {
+		return fmt.Errorf("%sAPI_KEYS_FILE 指向的文件为空: %s", EnvPrefix, p)
+	}
+	c.Facade.APIKeys = keys
+	return nil
 }
 
 func splitCSV(s string) []string {

@@ -3,6 +3,7 @@ package facade
 import (
 	"encoding/json"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/oai-prism/oaiprism/internal/prism"
 )
@@ -140,11 +141,30 @@ func bridgePrompt() string {
 
 // bridgeInputItems 把 Codex CLI 的 input 数组翻译成上游 input。
 //
-// 与 messagesFromResponsesInput 的区别：工具条目（custom_tool_call /
-// custom_tool_call_output / function_call / function_call_output）必须
-// 保留为文本 —— 上游需要看到它上一轮"发出"的指令和客户端的执行结果，
-// 否则每轮都会重新规划已经做过的操作。
-func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputItem {
+// 上游对 input 数组的真实语义（2026-10-01 受控实验实测，见 docs/协议校准报告.md 第八节）：
+//
+//   - 第一条 system 条目 → 系统上下文（有效）；
+//   - 最后一条 user 条目 → 当轮提示（有效）；
+//   - **其余条目一律丢弃**（包括更早的 user / assistant / system）。
+//
+// 也就是说"在 input 里重放完整对话"对上游无效 —— 模型每轮只看到最后一条
+// user 消息。这正是"模型收到文件读取结果却问'你要我干什么'"的根源。
+// （chat 路径的 translateChatMessages 早已针对该缺陷把历史折进首条 system；
+// 桥路径此前没有做同样的处理。）
+//
+// 因此这里把整个对话（环境/任务/上一轮调用/客户端执行结果）
+// **全部折叠进唯一一条 user 消息**，桥指令保留为首条 system。
+//
+// CLI 的 developer 消息（Codex 人设、skills、multi-agent，合计约 35 KB）不折进来：
+//   - 上游对这条 user 消息有未公开的体积上限，带上它们会触发
+//     "This request is too large to send"；
+//   - 它们是为 Codex 原生函数调用写的，与桥的 codex-exec 协议相冲突
+//     （正是收尾强化指令要压制的东西）；
+//   - 折叠之前它们作为非首条 system 发送，本来就被上游丢弃，桥照样能工作。
+//
+// AGENTS.md 与 environment_context 在 CLI 里是 user 消息，照常保留。
+// budget 是这条 user 消息的字节上限（含收尾指令），见 runBridge。
+func bridgeInputItems(raw json.RawMessage, defaultSystem string, budget int) []prism.InputItem {
 	var blocks []struct {
 		Type   string `json:"type"`
 		Role   string `json:"role"`
@@ -162,9 +182,6 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 	if err := json.Unmarshal(raw, &blocks); err != nil {
 		return nil
 	}
-
-	items := make([]prism.InputItem, 0, len(blocks)+3)
-	items = append(items, prism.NewSystemItem(defaultSystem+"\n\n"+bridgePrompt()))
 
 	textOf := func(r json.RawMessage) string {
 		if len(r) == 0 {
@@ -210,6 +227,15 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 		return ""
 	}
 
+	// 逐块渲染成带角色标注的文本段，稍后拼进唯一一条 user 消息。
+	segments := make([]string, 0, len(blocks)+2)
+	addSegment := func(header, text string) {
+		if strings.TrimSpace(text) == "" {
+			return
+		}
+		segments = append(segments, "--- "+header+" ---\n"+text)
+	}
+
 	for _, b := range blocks {
 		switch b.Type {
 		case "message":
@@ -217,13 +243,11 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 			text := contentText(b.Content)
 			switch role {
 			case "developer", "system":
-				if strings.TrimSpace(text) != "" {
-					items = append(items, prism.NewSystemItem(text))
-				}
+				// 不折叠，原因见函数注释。
 			case "assistant":
-				items = append(items, prism.NewAssistantItem(text))
+				addSegment("ASSISTANT (your previous reply)", text)
 			default:
-				items = append(items, prism.NewUserItem(text))
+				addSegment("USER", text)
 			}
 		case "custom_tool_call", "function_call":
 			// 上游"上一轮"发出的调用：以它原始的样子回放，
@@ -235,8 +259,8 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 			if strings.TrimSpace(call) == "" {
 				call = textOf(b.Arguments)
 			}
-			items = append(items, prism.NewAssistantItem(
-				"```codex-exec\n"+replayCallText(call)+"\n```"))
+			addSegment("ASSISTANT (your previous planned operation)",
+				"```codex-exec\n"+replayCallText(call)+"\n```")
 		case "custom_tool_call_output", "function_call_output":
 			header := "[CLIENT RESULT]"
 			if b.CallID != "" || b.Name != "" {
@@ -257,20 +281,18 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 			// （真实案例：CLI v0.159 把 exec 改名为 exec_command 后，
 			//   旧会话历史里残留的 unsupported 记录会持续污染整轮对话。）
 			if strings.Contains(out, "unsupported custom tool call") {
-				items = append(items, prism.NewUserItem(
-					header+"\n客户端拒绝了上次调用（工具名不被支持）：`"+
-						truncateRunes(out, 120)+"`。\n"+
-						"这不代表你没有工具 —— 请立刻用客户端注册的工具名重新输出**完整的** "+
-						"```codex-exec 块（包含全部命令与文件内容），客户端会执行它。"+
-						"不要再要求用户重发任务。\n[/CLIENT RESULT]"))
+				addSegment("CLIENT RESULT", header+"\n客户端拒绝了上次调用（工具名不被支持）：`"+
+					truncateRunes(out, 120)+"`。\n"+
+					"这不代表你没有工具 —— 请立刻用客户端注册的工具名重新输出**完整的** "+
+					"```codex-exec 块（包含全部命令与文件内容），客户端会执行它。"+
+					"不要再要求用户重发任务。\n[/CLIENT RESULT]")
 				continue
 			}
 
 			// 用户主动中断：既不是执行失败，也不是模型的错。明确标注，
 			// 否则模型会困惑于"为什么没有结果"而反复追问。
 			if strings.TrimSpace(out) == "aborted" {
-				items = append(items, prism.NewUserItem(
-					header+"\n（用户主动中断了这次执行，并非工具失败。）\n[/CLIENT RESULT]"))
+				addSegment("CLIENT RESULT", header+"\n（用户主动中断了这次执行，并非工具失败。）\n[/CLIENT RESULT]")
 				continue
 			}
 
@@ -279,28 +301,141 @@ func bridgeInputItems(raw json.RawMessage, defaultSystem string) []prism.InputIt
 			// 把这一点告诉模型；否则它会以为内容丢了，转而去要求用户
 			// "把原始内容再发一遍"（实测就是在这里绕圈的）。
 			if isShellSyntaxError(out) {
-				items = append(items, prism.NewUserItem(
-					header+"\n"+truncateRunes(out, 300)+"\n"+
-						"CLIENT SHELL NOTE: 这个客户端的 shell 是 Windows PowerShell 7，不是 bash —— "+
-						"`cat >`、`<<'EOF'` heredoc、`printf >` 这类 bash 专用语法在这里会直接语法报错。\n"+
-						"请立刻改用 PowerShell 语法重发**完整的** ```codex-exec 块（内容必须完整，不要省略、不要再要求用户提供原始内容）：\n"+
-						"  const out = await tools.exec_command({ cmd: \"$c = @'\n<完整文件内容>\n'@; Set-Content -LiteralPath '<路径>' -Value $c -NoNewline\" });\n"+
-						"[/CLIENT RESULT]"))
+				addSegment("CLIENT RESULT", header+"\n"+truncateRunes(out, 300)+"\n"+
+					"CLIENT SHELL NOTE: 这个客户端的 shell 是 Windows PowerShell 7，不是 bash —— "+
+					"`cat >`、`<<'EOF'` heredoc、`printf >` 这类 bash 专用语法在这里会直接语法报错。\n"+
+					"请立刻改用 PowerShell 语法重发**完整的** ```codex-exec 块（内容必须完整，不要省略、不要再要求用户提供原始内容）：\n"+
+					"  const out = await tools.exec_command({ cmd: \"$c = @'\n<完整文件内容>\n'@; Set-Content -LiteralPath '<路径>' -Value $c -NoNewline\" });\n"+
+					"[/CLIENT RESULT]")
 				continue
 			}
 
-			items = append(items, prism.NewUserItem(
-				header+"\n"+out+"\n[/CLIENT RESULT]"))
+			// 空输出也必须回放：mkdir、Set-Content 这类命令成功时就是没有输出，
+			// 漏掉这一条，模型看不到"已执行"，会重做一遍或反问用户。
+			if strings.TrimSpace(out) == "" {
+				out = "（执行完毕，无输出）"
+			}
+			addSegment("CLIENT RESULT", header+"\n"+out+"\n[/CLIENT RESULT]")
 		default:
 			// additional_tools / reasoning / 其它非消息条目：跳过。
 		}
 	}
-	// 收尾强化指令。LLM 对序列末尾的指令服从度最高 ——
-	// 桥指令只放在开头会被 CLI 传入的 Codex 人设（4 条 developer
-	// 消息，要求"使用 exec 工具"）压过去：实测模型无视开头的桥指令，
-	// 直接在云端沙箱里执行并口头汇报"已创建"。末尾重申一次。
-	items = append(items, prism.NewSystemItem(bridgeTailReminder()))
-	return items
+
+	// 收尾强化指令。LLM 对序列末尾的指令服从度最高 —— 桥指令除了放在
+	// 首条 system 外，在唯一 user 消息的末尾再重申一次。
+	// 放在折叠之外拼接：无论历史怎么裁剪，它都一定在最后。
+	tail := transcriptSep + bridgeTailReminder()
+	return []prism.InputItem{
+		prism.NewSystemItem(defaultSystem + "\n\n" + bridgePrompt()),
+		prism.NewUserItem(foldTranscript(segments, budget-len(tail)) + tail),
+	}
+}
+
+// 桥 user 消息的字节预算。上游限额未公开（实测：约 4 KB 通过、约 40 KB 被拒），
+// 所以从 bridgeDefaultBudget 起步，被拒时减半重试并记住结果，见 runBridge。
+// CLI 每轮重放全量历史，长会话下折叠文本会持续增长，预算决定保留多少。
+const (
+	bridgeDefaultBudget = 32 << 10
+	bridgeMinBudget     = 8 << 10
+)
+
+// isRequestTooLarge 判断上游是否以"请求过大"拒绝了这次生成。
+// 上游原文："This request is too large to send. Please shorten your message
+// or selected text and try again."，经 runner 包装为"上游生成失败 [unknown]: …"。
+func isRequestTooLarge(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "too large")
+}
+
+// withBridgeNudge 把纠错消息追加到最后一条 user 消息里，而不是另起一条。
+// 上游只认最后一条 user：另起一条会让模型只看到纠错、看不到任务，转而反问用户。
+func withBridgeNudge(items []prism.InputItem, nudge string) []prism.InputItem {
+	out := append([]prism.InputItem(nil), items...)
+	for i := len(out) - 1; i >= 0; i-- {
+		if out[i].Role != "user" || len(out[i].Content) == 0 {
+			continue
+		}
+		content := append([]prism.InputContent(nil), out[i].Content...)
+		last := len(content) - 1
+		content[last].Text += transcriptSep + nudge
+		out[i].Content = content
+		return out
+	}
+	return append(out, prism.NewUserItem(nudge))
+}
+
+const (
+	transcriptSep     = "\n\n"
+	transcriptOmitted = "\n\n--- [... 中段历史因长度限制被省略；任务目标见开头，最近状态见下 ...] ---\n\n"
+)
+
+// foldTranscript 把文本段拼成一段历史，超过 limit 时丢弃中段。
+//
+// 先从末尾装最近的段（当前操作状态，最多 2/3 预算），剩余预算再从开头装
+// 最早的段（人设/任务目标）。单段本身超出预算时截断保留其开头，
+// 而不是整段丢掉 —— 最近一次读文件的结果往往正是最大、也最要紧的那段。
+func foldTranscript(segments []string, limit int) string {
+	total := 0
+	for i, s := range segments {
+		if i > 0 {
+			total += len(transcriptSep)
+		}
+		total += len(s)
+	}
+	if total <= limit {
+		return strings.Join(segments, transcriptSep)
+	}
+
+	budget := limit - len(transcriptOmitted)
+	// fill 依次装入 at(0), at(1), … 直到 room 用尽；第一段就装不下时截断装入。
+	fill := func(room int, n int, at func(int) string) ([]string, int) {
+		var got []string
+		for k := 0; k < n; k++ {
+			s := at(k)
+			if len(s)+len(transcriptSep) > room {
+				if len(got) == 0 {
+					got = append(got, truncateBytes(s, room-len(transcriptSep)))
+				}
+				break
+			}
+			got = append(got, s)
+			room -= len(s) + len(transcriptSep)
+		}
+		return got, room
+	}
+
+	// 尾部：最近的段优先，最多 2/3 预算。
+	tail, tailLeft := fill(budget*2/3, len(segments), func(k int) string {
+		return segments[len(segments)-1-k]
+	})
+	for a, b := 0, len(tail)-1; a < b; a, b = a+1, b-1 {
+		tail[a], tail[b] = tail[b], tail[a]
+	}
+	// 头部：剩余预算（含尾部没用完的部分）全给开头。
+	rest := len(segments) - len(tail)
+	head, _ := fill(budget-budget*2/3+tailLeft, rest, func(k int) string {
+		return segments[k]
+	})
+
+	if len(head) < rest {
+		return strings.Join(head, transcriptSep) + transcriptOmitted + strings.Join(tail, transcriptSep)
+	}
+	return strings.Join(append(head, tail...), transcriptSep)
+}
+
+// truncateBytes 把 s 截到不超过 n 字节（含截断标记），不切断 UTF-8 字符。
+func truncateBytes(s string, n int) string {
+	const mark = "\n…[超长已截断]"
+	if len(s) <= n {
+		return s
+	}
+	cut := n - len(mark)
+	if cut <= 0 {
+		return ""
+	}
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + mark
 }
 
 // bridgeRetryNudge 是"模型没用桥格式"时的自动纠正消息。
@@ -314,6 +449,37 @@ func bridgeRetryNudge(prevText string) string {
 		`Your previous reply was: "` + truncateRunes(prevText, 300) + `"`,
 	}, "\n")
 }
+
+// bridgeClaimsAction 判断模型的纯文本回复是否"声称执行过操作"。
+//
+// 桥的自动纠错（bridgeRetryNudge）只该打向"在云端沙箱里干完活还口头汇报"
+// 的回复；对"1+1=2"这类本来就无需工具的纯回答，纠错会把模型带偏成
+// 反问用户"你要我执行什么"（实测如此），反而毁掉正常回答。
+// 用动作声明关键词做启发式：声称创建/写入/执行过才需要纠正。
+func bridgeClaimsAction(text string) bool {
+	l := strings.ToLower(text)
+	for _, sig := range claimSignals {
+		if strings.Contains(l, sig) {
+			return true
+		}
+	}
+	return false
+}
+
+// claimSignals 是"声称执行过操作"的关键词（已小写）。
+// 子串匹配：短词已覆盖长短语（"created" 覆盖 "created the file"）。
+var claimSignals = func() []string {
+	out := []string{
+		"created", "wrote", "written", "saved", "modified", "deleted",
+		"removed the file", "updated the file", "executed",
+		"ran the command", "ran the script", "applied the patch",
+	}
+	// "已创建" 不是 "已经创建" 的子串，两种说法都要列。
+	for _, v := range []string{"创建", "写入", "保存", "修改", "更新", "删除", "执行", "运行", "应用"} {
+		out = append(out, "已"+v, "已经"+v)
+	}
+	return out
+}()
 
 func truncateRunes(s string, n int) string {
 	r := []rune(s)
@@ -616,6 +782,66 @@ func strippedTextItemJSON(id, text string) string {
 	writeJSONString(&sb, text)
 	sb.WriteString(`,"annotations":[]}]}`)
 	return sb.String()
+}
+
+// reasoningItemJSON 构造 reasoning 条目，Codex 据此显示思考摘要。
+func reasoningItemJSON(id, summary string) string {
+	var sb strings.Builder
+	sb.WriteString(`{"id":`)
+	writeJSONString(&sb, id)
+	sb.WriteString(`,"type":"reasoning","summary":[{"type":"summary_text","text":`)
+	writeJSONString(&sb, summary)
+	sb.WriteString(`}]}`)
+	return sb.String()
+}
+
+// bridgeItem 是桥模式一次回复里的一个输出条目。
+type bridgeItem struct {
+	kind string // reasoning | message | tool
+	id   string
+	json string
+	text string // message 的正文；custom_tool_call 的 JS（需额外发 input.done 事件）
+}
+
+// bridgeOutputItems 把桥模式的一次回复拆成原生 Responses 的条目序列：
+// [思考摘要] [说明文字] [工具调用]。
+//
+// 原生 Codex 执行命令前会先显示一句说明（"先看看目录结构"）和思考摘要；
+// 只回工具调用的话，这两样在界面上都会消失，用户只看到命令一条条冒出来。
+func bridgeOutputItems(text, reasoning, js, execKind, execToolName string) []bridgeItem {
+	var items []bridgeItem
+	if r := strings.TrimSpace(reasoning); r != "" {
+		id := newID("rs_")
+		items = append(items, bridgeItem{kind: "reasoning", id: id, json: reasoningItemJSON(id, r)})
+	}
+	msg := text
+	if js != "" {
+		msg = bridgePreamble(text)
+	}
+	// 纯文本回复即使为空也要有 message 条目，否则客户端拿不到任何输出。
+	if js == "" || msg != "" {
+		id := newID("msg_")
+		items = append(items, bridgeItem{kind: "message", id: id, json: strippedTextItemJSON(id, msg), text: msg})
+	}
+	if js != "" {
+		id := newID("ctc_")
+		if execKind == "function" {
+			items = append(items, bridgeItem{kind: "tool", id: id,
+				json: functionCallItemJSON(id, execToolName, toFunctionArguments(js))})
+		} else {
+			items = append(items, bridgeItem{kind: "tool", id: id,
+				json: customToolCallItemJSON(id, js, execToolName), text: js})
+		}
+	}
+	return items
+}
+
+// bridgePreamble 取 codex-exec 块之前的说明文字。
+func bridgePreamble(text string) string {
+	if i := strings.Index(text, "```codex-exec"); i >= 0 {
+		return strings.TrimSpace(text[:i])
+	}
+	return ""
 }
 
 func writeJSONString(sb *strings.Builder, s string) {

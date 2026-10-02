@@ -180,3 +180,25 @@ func TestDescribeSyncStatus(t *testing.T) {
 		}
 	}
 }
+
+// TestSandboxCache_SyncingAnotherProjectUnbinds 验证沙箱一次只绑定一个项目：
+// 同步了 p2 之后，p1 的记录即使未过期也不再算"已同步"，下一轮必须重新同步。
+func TestSandboxCache_SyncingAnotherProjectUnbinds(t *testing.T) {
+	c := newSandboxCache(time.Hour)
+	c.Put("acct", &prism.Sandbox{URL: "https://sb", Token: "tok"})
+	until := time.Now().Add(time.Hour)
+
+	c.MarkSynced("acct", "p1", until)
+	c.MarkSynced("acct", "p2", until)
+	if c.Synced("acct", "p1") {
+		t.Error("沙箱已改绑 p2，p1 不应再算已同步")
+	}
+	if !c.Synced("acct", "p2") {
+		t.Error("p2 应为已同步")
+	}
+
+	c.MarkSynced("acct", "p1", until)
+	if !c.Synced("acct", "p1") || c.Synced("acct", "p2") {
+		t.Error("重新同步 p1 后应只有 p1 处于绑定状态")
+	}
+}

@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"unicode/utf8"
+
+	"github.com/oai-prism/oaiprism/internal/prism"
 )
 
 // TestExtractExecBlock 覆盖围栏提取的三种形态。
@@ -246,7 +249,7 @@ func TestBridgeResultTextArray(t *testing.T) {
 		{"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{\"cmd\":\"echo hi\"}"},
 		{"type":"function_call_output","call_id":"c1","output":[{"type":"input_text","text":"Script completed"},{"type":"input_text","text":"{\"chunk_id\":\"x\"}"}]}
 	]`)
-	items := bridgeInputItems(raw, "sys")
+	items := bridgeInputItems(raw, "sys", bridgeDefaultBudget)
 	b, err := json.Marshal(items)
 	if err != nil {
 		t.Fatalf("序列化失败: %v", err)
@@ -307,7 +310,7 @@ func TestBridgeInputReplayFunctionCall(t *testing.T) {
 		{"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{\"cmd\":\"Set-Content -Path 'a.txt' -Value 'hi'\"}"},
 		{"type":"function_call_output","call_id":"c1","output":"Added a.txt (+1 -0)"}
 	]`)
-	items := bridgeInputItems(raw, "sys")
+	items := bridgeInputItems(raw, "sys", bridgeDefaultBudget)
 	b, err := json.Marshal(items)
 	if err != nil {
 		t.Fatalf("序列化失败: %v", err)
@@ -366,7 +369,7 @@ func TestBridgeInputItems(t *testing.T) {
 		{"type":"custom_tool_call_output","call_id":"c1","output":"[CLIENT RESULT]\nfile written\n[/CLIENT RESULT]"},
 		{"type":"reasoning","summary":[]}
 	]`)
-	items := bridgeInputItems(raw, "base")
+	items := bridgeInputItems(raw, "base", bridgeDefaultBudget)
 	if len(items) == 0 {
 		t.Fatal("翻译结果为空")
 	}
@@ -380,8 +383,8 @@ func TestBridgeInputItems(t *testing.T) {
 	if !strings.Contains(all, "bridge") || !strings.Contains(all, "codex-exec") {
 		t.Error("桥指令必须注入（含 codex-exec 契约）")
 	}
-	if !strings.Contains(all, "be helpful") {
-		t.Error("developer 消息应保留")
+	if strings.Contains(all, "be helpful") {
+		t.Error("CLI 的 developer 消息不应折进上游请求（体积上限 + 与桥协议冲突）")
 	}
 	if !strings.Contains(all, "make a file") {
 		t.Error("user 任务应保留")
@@ -417,5 +420,127 @@ func TestCustomToolCallItemJSON(t *testing.T) {
 	}
 	if m["input"] != "await tools.exec_command()" {
 		t.Errorf("input 应为 JS 源码字符串: %s", item)
+	}
+}
+
+// TestBridgeInputFoldsIntoTwoItems 验证上游只认"首条 system + 最后一条 user"后的折叠形状。
+func TestBridgeInputFoldsIntoTwoItems(t *testing.T) {
+	raw := []byte(`[
+	{"type":"message","role":"developer","content":"be helpful"},
+	{"type":"message","role":"user","content":[{"type":"input_text","text":"make dir x"}]},
+	{"type":"function_call","call_id":"c1","name":"exec_command","arguments":"{\"cmd\":\"mkdir x\"}"},
+	{"type":"function_call_output","call_id":"c1","output":""}]`)
+	items := bridgeInputItems(raw, "sys", bridgeDefaultBudget)
+	if len(items) != 2 || items[0].Role != "system" || items[1].Role != "user" {
+		t.Fatalf("应折叠为 [system, user]，得到 %+v", items)
+	}
+	user := items[1].Content[0].Text
+	for _, want := range []string{"make dir x", "mkdir x", "[CLIENT RESULT call_id=c1]", "无输出", "[/CLIENT RESULT]"} {
+		if !strings.Contains(user, want) {
+			t.Errorf("折叠后的 user 消息缺少 %q", want)
+		}
+	}
+	if !strings.HasSuffix(user, bridgeTailReminder()) {
+		t.Error("收尾强化指令必须在最后")
+	}
+}
+
+func TestFoldTranscript(t *testing.T) {
+	const limit = 10000
+	seg := func(tag string, n int) string { return tag + strings.Repeat("x", n) }
+
+	t.Run("未超限原样拼接", func(t *testing.T) {
+		if got := foldTranscript([]string{"a", "b"}, limit); got != "a\n\nb" {
+			t.Errorf("got %q", got)
+		}
+	})
+
+	t.Run("超限时尾部占大头且不超预算", func(t *testing.T) {
+		var segs []string
+		for i := 0; i < 100; i++ {
+			segs = append(segs, seg("S", 300))
+		}
+		segs[0] = seg("TASK", 300)
+		segs[99] = seg("LATEST", 300)
+		got := foldTranscript(segs, limit)
+		if len(got) > limit {
+			t.Fatalf("超出上限: %d > %d", len(got), limit)
+		}
+		i := strings.Index(got, "中段历史")
+		if i < 0 || !strings.HasPrefix(got, "TASK") || !strings.Contains(got[i:], "LATEST") {
+			t.Fatal("应保留开头任务与最近状态，并标注省略")
+		}
+		if head, tail := i, len(got)-i; tail < 2*head-1000 {
+			t.Errorf("尾部应约占 2/3：head=%d tail=%d", head, tail)
+		}
+	})
+
+	t.Run("最近一段超大时截断保留而不是丢掉", func(t *testing.T) {
+		got := foldTranscript([]string{"TASK", seg("LATEST", 3*limit)}, limit)
+		if len(got) > limit || !strings.Contains(got, "LATEST") || !strings.Contains(got, "超长已截断") {
+			t.Errorf("len=%d, 应截断保留最近一段", len(got))
+		}
+	})
+
+	t.Run("截断不切断 UTF-8", func(t *testing.T) {
+		got := foldTranscript([]string{"任务", strings.Repeat("中文", limit)}, limit)
+		if !utf8.ValidString(got) {
+			t.Error("截断切断了多字节字符")
+		}
+	})
+}
+
+func TestBridgeClaimsAction(t *testing.T) {
+	for _, s := range []string{"I created the file a.txt", "已创建 hello.py", "我已经创建了文件", "Ran the command successfully"} {
+		if !bridgeClaimsAction(s) {
+			t.Errorf("应判定为声称执行过: %q", s)
+		}
+	}
+	for _, s := range []string{"42.", "CODEX-OK", "1+1=2", ""} {
+		if bridgeClaimsAction(s) {
+			t.Errorf("纯回答不应触发纠错: %q", s)
+		}
+	}
+}
+
+// TestBridgeInputRespectsBudget 验证 developer 不折入、整条 user 消息不超预算、收尾指令仍在最后。
+func TestBridgeInputRespectsBudget(t *testing.T) {
+	big := strings.Repeat("persona ", 5000) // 约 40 KB，模拟 Codex 人设
+	var hist []string
+	for i := 0; i < 60; i++ {
+		hist = append(hist, `{"type":"message","role":"user","content":"`+strings.Repeat("u", 1000)+`"}`)
+	}
+	raw := []byte(`[{"type":"message","role":"developer","content":"` + big + `"},` +
+		`{"type":"message","role":"user","content":"TASK: build it"},` + strings.Join(hist, ",") +
+		`,{"type":"message","role":"user","content":"LATEST"}]`)
+
+	items := bridgeInputItems(raw, "", bridgeMinBudget)
+	user := items[len(items)-1].Content[0].Text
+	if len(user) > bridgeMinBudget {
+		t.Errorf("user 消息 %d 字节，超出预算 %d", len(user), bridgeMinBudget)
+	}
+	if strings.Contains(user, "persona") {
+		t.Error("developer 消息被折了进来")
+	}
+	if !strings.Contains(user, "TASK: build it") || !strings.Contains(user, "LATEST") {
+		t.Error("应保留开头的任务与最近一条消息")
+	}
+	if !strings.HasSuffix(user, bridgeTailReminder()) {
+		t.Error("收尾强化指令必须在最后")
+	}
+}
+
+// TestWithBridgeNudge 验证纠错并入最后一条 user，而不是另起一条（上游只认最后一条 user）。
+func TestWithBridgeNudge(t *testing.T) {
+	items := []prism.InputItem{prism.NewSystemItem("sys"), prism.NewUserItem("TASK + history")}
+	got := withBridgeNudge(items, "NUDGE")
+	if len(got) != 2 {
+		t.Fatalf("不应新增条目，得到 %d 条", len(got))
+	}
+	if txt := got[1].Content[0].Text; !strings.HasPrefix(txt, "TASK + history") || !strings.HasSuffix(txt, "NUDGE") {
+		t.Errorf("纠错应追加在原 user 消息末尾: %q", txt)
+	}
+	if items[1].Content[0].Text != "TASK + history" {
+		t.Error("不应修改原切片（重试失败时还要用原输入）")
 	}
 }

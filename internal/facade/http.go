@@ -24,6 +24,9 @@ type Handler struct {
 	log    *slog.Logger
 	runner *Runner
 	app    *metrics.App
+
+	// bridgeLimit 是已学到的桥 user 消息预算（字节，0 = 尚未学到），见 runBridge。
+	bridgeLimit atomic.Int64
 }
 
 // NewHandler 构造门面处理器。

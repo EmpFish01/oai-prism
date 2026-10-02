@@ -49,3 +49,43 @@ func TestApplyEnv_Aliases(t *testing.T) {
 		t.Errorf("PRISM_COOKIE 别名未生效: %+v", cfg.Creds.Accounts)
 	}
 }
+
+func TestLoad_APIKeysFile(t *testing.T) {
+	dir := t.TempDir()
+	keyFile := dir + "/api-key"
+	if err := os.WriteFile(keyFile, []byte("sk-one\r\nsk-two, sk-three\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv(EnvPrefix+"API_KEYS_FILE", keyFile)
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []string{"sk-one", "sk-two", "sk-three"}
+	if len(cfg.Facade.APIKeys) != len(want) {
+		t.Fatalf("APIKeys = %+v, want %+v", cfg.Facade.APIKeys, want)
+	}
+	for i := range want {
+		if cfg.Facade.APIKeys[i] != want[i] {
+			t.Errorf("APIKeys[%d] = %q, want %q", i, cfg.Facade.APIKeys[i], want[i])
+		}
+	}
+
+	// 空文件、缺失文件、与 API_KEYS 混用都必须报错，而不是静默关闭鉴权。
+	empty := dir + "/empty"
+	_ = os.WriteFile(empty, []byte(" \n"), 0o600)
+	t.Setenv(EnvPrefix+"API_KEYS_FILE", empty)
+	if _, err := Load(""); err == nil {
+		t.Error("空密钥文件应当报错")
+	}
+	t.Setenv(EnvPrefix+"API_KEYS_FILE", dir+"/missing")
+	if _, err := Load(""); err == nil {
+		t.Error("缺失的密钥文件应当报错")
+	}
+	t.Setenv(EnvPrefix+"API_KEYS_FILE", keyFile)
+	t.Setenv(EnvPrefix+"API_KEYS", "sk-env")
+	if _, err := Load(""); err == nil {
+		t.Error("API_KEYS 与 API_KEYS_FILE 同时设置应当报错")
+	}
+}

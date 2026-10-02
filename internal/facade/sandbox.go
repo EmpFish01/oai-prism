@@ -29,6 +29,15 @@ type sandboxEntry struct {
 	sb      *prism.Sandbox
 	expires time.Time
 
+	// bound 是沙箱当前实际绑定的项目。
+	//
+	// 沙箱一次只服务一个项目：它的状态里资源项目、Y-Sweet 凭证都是单数
+	// （hasResourceProjectId / hasCurrentYSweetToken），资源令牌也只带一个
+	// projectId。给它同步项目 B 就会顶掉项目 A —— 此时 A 的同步记录虽未过期，
+	// 却已不再成立。只看 projects 会误判 A 仍可用，A 的下一轮跳过同步直接 start，
+	// 落到一个指向别的项目的沙箱上。
+	bound string
+
 	// projects: projectID -> 该次同步所用资源令牌的过期时刻。
 	//
 	// 拿令牌的过期时间当缓存失效点，而不是自己拍一个 TTL：
@@ -71,25 +80,27 @@ func (c *sandboxCache) Put(accountID string, sb *prism.Sandbox) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	projects := map[string]time.Time{}
+	bound := ""
 	if old, ok := c.items[accountID]; ok && old.sb != nil && old.sb.Token == sb.Token {
-		projects = old.projects
+		projects, bound = old.projects, old.bound
 	}
 	c.items[accountID] = &sandboxEntry{
 		sb:       sb,
 		expires:  time.Now().Add(c.ttl),
+		bound:    bound,
 		projects: projects,
 	}
 }
 
-// Synced 报告该沙箱是否已为该项目完成工作区同步且令牌仍有效。
+// Synced 报告沙箱当前是否绑定在该项目上，且同步所用的令牌仍有效。
 func (c *sandboxCache) Synced(accountID, projectID string) bool {
 	if projectID == "" {
 		return false
 	}
 	c.mu.RLock()
+	defer c.mu.RUnlock()
 	e, ok := c.items[accountID]
-	c.mu.RUnlock()
-	if !ok {
+	if !ok || e.bound != projectID {
 		return false
 	}
 	until, ok := e.projects[projectID]
@@ -107,6 +118,7 @@ func (c *sandboxCache) MarkSynced(accountID, projectID string, until time.Time) 
 			e.projects = make(map[string]time.Time, 2)
 		}
 		e.projects[projectID] = until
+		e.bound = projectID
 	}
 	c.mu.Unlock()
 }
@@ -126,6 +138,9 @@ func (c *sandboxCache) InvalidateProject(accountID, projectID string) {
 	c.mu.Lock()
 	if e, ok := c.items[accountID]; ok {
 		delete(e.projects, projectID)
+		if e.bound == projectID {
+			e.bound = ""
+		}
 	}
 	c.mu.Unlock()
 }
@@ -135,13 +150,15 @@ func (c *sandboxCache) Lock(accountID string) func() {
 	return c.locks.Lock(accountID)
 }
 
-// LockProject 返回按 (账号, 项目) 粒度的互斥锁。
+// LockSync 返回按账号（也就是按沙箱）粒度的同步互斥锁。
 //
-// 保证同一个项目只有一个在飞的同步流程：并发的相同请求应当**等**
-// 前一个同步完成，而不是各自去申请一份资源令牌 ——
-// 后者会同时创建多个沙箱会话，白白消耗额度。
-func (c *sandboxCache) LockProject(accountID, projectID string) func() {
-	return c.locks.Lock(accountID + "\x00" + projectID)
+// 同一个项目的并发请求应当**等**前一个同步完成，而不是各自去签一份
+// 资源令牌（那会同时开多个沙箱会话，白耗额度）。不同项目也必须排队：
+// 它们同步的是同一个沙箱，交错发送令牌会互相覆盖。实测（2026-10-01）
+// Codex 桌面版的标题请求与正文请求同时同步时，出现 Y-Sweet 凭证交付失败、
+// 沙箱被重置、正文请求失败重试。
+func (c *sandboxCache) LockSync(accountID string) func() {
+	return c.locks.Lock(accountID + "\x00sync")
 }
 
 // Size 当前缓存的沙箱数（供运维端点展示）。

@@ -2,6 +2,7 @@ package facade
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -68,6 +69,10 @@ type RunRequest struct {
 	// 同步模式会把它收紧到 facade.sync_timeout —— 让一个 HTTP 请求
 	// 挂 15 分钟才返回是不可接受的，客户端早就超时了。
 	Deadline time.Duration
+
+	// BridgeInput 是桥模式下 CLI 的原始 input。上游以"请求过大"拒绝时，
+	// 门面据此按更小的预算重建 Input（见 Handler.runBridge）；Runner 不读它。
+	BridgeInput json.RawMessage
 }
 
 // Delta 是一次增量。
@@ -566,23 +571,6 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 			interval = nextInterval(interval, f.PollBackoffMax)
 		}
 
-		// 统一的轮询节流。
-		//
-		// 这里必须是"无条件节流"，不能只在空轮询时睡：
-		// 如果上游每轮都返回累计正文（也就每轮都有增量），
-		// "有增量就立刻再问一次"会让循环退化成零间隔的忙轮询 ——
-		// 4 次轮询 20 毫秒跑完，等于在对上游做拒绝服务。
-		// （这个 bug 是被"客户端断开后应通知上游停止"的测试顺带抓出来的。）
-		//
-		// 规则：本轮耗时已经 >= 目标间隔，说明服务端本身就在等
-		// （长轮询语义），直接进下一轮；否则补足差值。
-		if elapsed < interval {
-			if serr := sleepCtx(ctx, interval-elapsed); serr != nil {
-				r.stopUpstream(p, requestID, convID, turnState)
-				return result, serr
-			}
-		}
-
 		if st.Done {
 			if result.Text == "" {
 				result.Text = prev
@@ -597,6 +585,26 @@ func (r *Runner) runOnce(ctx context.Context, acct *account.Account, req *RunReq
 			}
 			r.journal.MarkTerminal(requestID, "completed", result.Text, nil)
 			return result, nil
+		}
+
+		// 统一的轮询节流（只在还要再问一轮时才睡）。
+		//
+		// 必须放在 Done 判断之后：节流是为了拉开下一次轮询，结果已经到手还
+		// 补睡一个间隔，只会让每一轮生成白白晚 1~3 秒（退避上限）才交给客户端。
+		//
+		// 这里必须是"无条件节流"，不能只在空轮询时睡：
+		// 如果上游每轮都返回累计正文（也就每轮都有增量），
+		// "有增量就立刻再问一次"会让循环退化成零间隔的忙轮询 ——
+		// 4 次轮询 20 毫秒跑完，等于在对上游做拒绝服务。
+		// （这个 bug 是被"客户端断开后应通知上游停止"的测试顺带抓出来的。）
+		//
+		// 规则：本轮耗时已经 >= 目标间隔，说明服务端本身就在等
+		// （长轮询语义），直接进下一轮；否则补足差值。
+		if elapsed < interval {
+			if serr := sleepCtx(ctx, interval-elapsed); serr != nil {
+				r.stopUpstream(p, requestID, convID, turnState)
+				return result, serr
+			}
 		}
 	}
 }
@@ -698,9 +706,8 @@ func (r *Runner) syncSandboxWorkspace(ctx context.Context, acct *account.Account
 		return true
 	}
 
-	// 同一项目只允许一个在飞的同步：并发的相同请求应该**等**前一个完成，
-	// 而不是各自去签一份资源令牌（那会同时开多个沙箱会话，白耗额度）。
-	unlock := r.sandboxes.LockProject(acct.ID, projectID)
+	// 同一沙箱同一时刻只允许一个在飞的同步，见 LockSync。
+	unlock := r.sandboxes.LockSync(acct.ID)
 	defer unlock()
 	if r.sandboxes.Synced(acct.ID, projectID) {
 		r.app.SandboxOps.Inc("sync", "hit")

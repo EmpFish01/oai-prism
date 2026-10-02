@@ -107,3 +107,34 @@ func TestAPIKeyAuth_ExemptProbes(t *testing.T) {
 		t.Errorf("带有效 key 的业务请求应返回 200，得到 %d", recBizAuth.Code)
 	}
 }
+
+// TestAPIKeyAuth_ExemptPrefix 验证以 "/" 结尾的豁免项只对 GET/HEAD 按前缀放行，且不能借 ".." 绕过。
+func TestAPIKeyAuth_ExemptPrefix(t *testing.T) {
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := APIKeyAuth([]string{"sk-test-key"}, nil, true, "/dashboard/")(next)
+
+	cases := []struct {
+		method, path string
+		want         int
+	}{
+		{http.MethodGet, "/dashboard", http.StatusOK},
+		{http.MethodGet, "/dashboard/", http.StatusOK},
+		{http.MethodGet, "/dashboard/assets/index.js", http.StatusOK},
+		{http.MethodHead, "/dashboard/favicon.svg", http.StatusOK},
+		{http.MethodPost, "/dashboard/", http.StatusUnauthorized},
+		{http.MethodGet, "/dashboardx", http.StatusUnauthorized},
+		{http.MethodGet, "/dashboard/../admin/accounts", http.StatusUnauthorized},
+		{http.MethodGet, "/admin/accounts", http.StatusUnauthorized},
+	}
+	for _, c := range cases {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(c.method, "http://x/", nil)
+		req.URL.Path = c.path
+		handler.ServeHTTP(rec, req)
+		if rec.Code != c.want {
+			t.Errorf("%s %s: 期望 %d，得到 %d", c.method, c.path, c.want, rec.Code)
+		}
+	}
+}

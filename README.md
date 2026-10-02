@@ -6,6 +6,8 @@ OpenAI Prism 的高性能反向代理。把 `prism.openai.com` 的内部 start +
 
 Go 单二进制，零 CGO，无运行时依赖。
 
+> 本机部署、Codex 接入与 SUB2API 中转见 [`docs/deploy.md`](docs/deploy.md)。
+
 ---
 
 ## 为什么是这个技术栈
